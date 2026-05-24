@@ -2,14 +2,16 @@
 Friday - Personal AI Assistant Telegram Bot
 Phase 1: Text conversation with Gemini + per-user memory
 
+Uses the new google-genai SDK (HTTP-based, no grpcio needed).
 Run with:  python bot.py
 """
 
 import logging
 import os
 
-import google.generativeai as genai
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -28,6 +30,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_NAME = os.getenv("OWNER_NAME", "Sir")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+MAX_HISTORY_TURNS = 20  # keep last 20 user/model exchanges
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
     raise RuntimeError(
@@ -36,9 +39,9 @@ if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
     )
 
 # ---------------------------------------------------------------------------
-# Configure Gemini with Friday's personality
+# Configure Gemini client + Friday's personality
 # ---------------------------------------------------------------------------
-genai.configure(api_key=GEMINI_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 SYSTEM_PROMPT = f"""You are Friday, a personal AI assistant for {OWNER_NAME}.
 
@@ -51,13 +54,12 @@ Personality:
 You can answer questions, help with tasks, brainstorm ideas, or just chat.
 """
 
-model = genai.GenerativeModel(
-    model_name=GEMINI_MODEL,
+GENERATION_CONFIG = types.GenerateContentConfig(
     system_instruction=SYSTEM_PROMPT,
 )
 
 # Per-user conversation history. Resets if the bot is restarted.
-user_chats: dict[int, "genai.ChatSession"] = {}
+user_histories: dict[int, list] = {}
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -69,11 +71,21 @@ logging.basicConfig(
 log = logging.getLogger("friday")
 
 
-def get_chat(user_id: int):
-    """Return an existing chat session or start a new one for this user."""
-    if user_id not in user_chats:
-        user_chats[user_id] = model.start_chat(history=[])
-    return user_chats[user_id]
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def get_history(user_id: int) -> list:
+    """Return mutable conversation history for this user."""
+    if user_id not in user_histories:
+        user_histories[user_id] = []
+    return user_histories[user_id]
+
+
+def trim_history(history: list, max_turns: int = MAX_HISTORY_TURNS) -> None:
+    """Keep history bounded so we do not blow past token limits."""
+    max_messages = max_turns * 2
+    if len(history) > max_messages:
+        del history[: len(history) - max_messages]
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +93,7 @@ def get_chat(user_id: int):
 # ---------------------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Greet the user and start a fresh session."""
-    user_chats.pop(update.effective_user.id, None)
+    user_histories.pop(update.effective_user.id, None)
     await update.message.reply_text(
         f"Hello {OWNER_NAME}. Friday online. What can I do for you?"
     )
@@ -89,7 +101,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Clear conversation memory for this user."""
-    user_chats.pop(update.effective_user.id, None)
+    user_histories.pop(update.effective_user.id, None)
     await update.message.reply_text("Memory cleared. Starting fresh.")
 
 
@@ -109,17 +121,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_text = update.message.text or ""
 
-    # Show "typing..." indicator while we wait for Gemini
+    # Show "typing..." indicator while Gemini thinks
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action="typing"
     )
 
+    history = get_history(user_id)
+    history.append({"role": "user", "parts": [{"text": user_text}]})
+
     try:
-        chat = get_chat(user_id)
-        response = await chat.send_message_async(user_text)
+        response = await client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=history,
+            config=GENERATION_CONFIG,
+        )
         reply_text = (response.text or "").strip() or "I am not sure how to respond to that."
+        history.append({"role": "model", "parts": [{"text": reply_text}]})
+        trim_history(history)
     except Exception as exc:  # noqa: BLE001 - surface any error to the user
         log.exception("Gemini request failed")
+        # Roll back the user message we appended so retry works clean
+        if history and history[-1].get("role") == "user":
+            history.pop()
         reply_text = f"Sorry, something went wrong: {exc}"
 
     await update.message.reply_text(reply_text)
